@@ -1163,12 +1163,12 @@ int copy_file(const char *src, const char *dst,
 		return -1;
 	}
 	r = transfer(srcfd, dstfd, total, bs, fdp, fout);
-	close(dstfd);
 	if (fout != NULL) {
 		fout->mtime = fstat(dstfd, &st) == -1
 			? time(NULL)
 			: st.st_mtime;
 	}
+	close(dstfd);
 	close(srcfd);
 	return r;
 }
