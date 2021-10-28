@@ -718,6 +718,7 @@ struct xferinfo {
 	blksize_t bs;		/* block size */
 	off_t deduped;		/* total deduplicated bytes */
 	off_t dedup_pending;	/* total bytes pending deduplication */
+	off_t dedup_found;	/* total bytes found to deduplicate */
 	struct file *fdplist;	/* start of the file list for deduplication */
 	struct file *fdp;	/* current file from which to deduplicate */
 	struct file_dedupe_range *rg;
@@ -772,6 +773,7 @@ static inline void print_xferstats(struct xferinfo *xi)
 	fprintf(stderr, " (S %.2f", (float)xi->sparsed / gb);
 #ifdef WITH_DEDUPE
 	fprintf(stderr, ", D %.2f", (float)xi->deduped / gb);
+	fprintf(stderr, " d %.2f", (float)xi->dedup_found / gb);
 #endif
 	fprintf(stderr, ") GB [%.2f MB/s]", (float)xi->xfersec / mb);
 	fprintf(stderr, "         \r");
@@ -937,6 +939,7 @@ static int try_dedupe(struct xferinfo *xi, off_t o, blksize_t bs, uint32_t hash)
 		return 0;
 	if ((f = find_valid_block(xi->fdplist, bs, hash, &bc)) == NULL)
 		return 0;
+	xi->dedup_found += bs;
 	bf = f->blocks;
 	if (f == xi->fdp
 		&& (off_t)xi->rgi->dest_offset + xi->dedup_pending == o) {
