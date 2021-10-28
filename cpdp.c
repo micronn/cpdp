@@ -1087,7 +1087,7 @@ int transfer(int srcfd, int dstfd, off_t total, blksize_t bs,
 #ifdef WITH_DEDUPE
 			try_dedupe(&xi, off, (blksize_t)nr, hash);
 			/* do not keep lots of queued dedupe data */
-			if ((idx & 0x1FFF) == 0x1FFF) flush_dedupe(&xi);
+			if ((idx & 0xFFFF) == 0xFFFF) flush_dedupe(&xi);
 #endif
 			if (bf != NULL && (size_t)nr == (size_t)bs) {
 				blk.idx = htole32(idx);
@@ -1184,6 +1184,12 @@ int copy_file(const char *src, const char *dst,
 	}
 	bs = fstat(dstfd, &st) == -1 ? 4096 : st.st_blksize;
 	if (fout != NULL && init_new_file(fout, dst) == -1) {
+		perror(dst);
+		close(dstfd);
+		close(srcfd);
+		return -1;
+	}
+	if (total != -1 && ftruncate(dstfd, total) == -1) {
 		perror(dst);
 		close(dstfd);
 		close(srcfd);
