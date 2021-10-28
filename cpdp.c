@@ -926,50 +926,74 @@ end:
 	xi->dedup_pending = 0;
 }
 
+/* given a sorted blocks array with bc blocks of size bs, a bcur current
+ * block, and a pos search position, look for: a block with the same hash
+ * as bcur that is at the pos offset, or the first with the same hash after
+ * pos, or the smallest with the same hash in blocks array, and set bpos
+ * to the found block position
+ */
+static inline void match_offset(
+		struct block *blocks, size_t bc, blksize_t bs,
+		struct block *bcur, off_t pos, off_t *bpos)
+{
+	struct block *borg, *bnext, *bl;
+	uint32_t lehash;
+	lehash = bcur->hash;
+	borg = bcur;
+	/* search forward if start position is less or equal than searched */
+	bl = blocks + bc;
+	do {
+		*bpos = (off_t)le32toh(bcur->idx) * bs;
+		if (*bpos < pos) bcur++;
+		else break;
+	} while (bcur < bl && bcur->hash == lehash);
+	if (*bpos == pos) return;
+	/* still less than searched? look for the smallest offset */
+	if (*bpos < pos) pos = 0;
+	/* search backward if start position is greater than searched */
+	bnext = borg;
+	bcur = borg - 1;
+	while (bcur >= blocks && bcur->hash == lehash) {
+		*bpos = (off_t)le32toh(bcur->idx) * bs;
+		if (*bpos > pos) bnext = bcur--;
+		else break;
+	}
+	if (*bpos == pos) return;
+	/* not found? try to use a position following searched */
+	if (*bpos < pos) {
+		*bpos = (off_t)le32toh(bnext->idx) * bs;
+	}
+}
+
 /* tries to deduplicate the block at offset o, size siz, and specified hash
  * returns 0 if block not found in candidate file list, 1 if found
  */
 static int try_dedupe(struct xferinfo *xi, off_t o, blksize_t bs, uint32_t hash)
 {
 	assert(xi != NULL);
-	struct block *bf, *bl, *bc, *btmp;
 	struct file *f;
+	struct block *bcur;
 	off_t blkoff, curoff;
 	if (xi->bs != bs)
 		return 0;
-	if ((f = find_valid_block(xi->fdplist, bs, hash, &bc)) == NULL)
+	if ((f = find_valid_block(xi->fdplist, bs, hash, &bcur)) == NULL)
 		return 0;
 	xi->dedup_found += bs;
-	bf = f->blocks;
-	if (f == xi->fdp
-		&& (off_t)xi->rgi->dest_offset + xi->dedup_pending == o) {
-		/* contiguous, and found at current file? try to match offset */
+	if (f == xi->fdp) {
 		curoff = (off_t)xi->rg->src_offset + xi->dedup_pending;
-		bl = bf + f->bc;
-		btmp = bc;
-		do {
-			blkoff = (off_t)le32toh(bc->idx) * f->bs;
-			if (curoff > blkoff) bc++;
-			else break;
-		} while (bc < bl && le32toh(bc->hash) == hash);
-		if (curoff != blkoff) {
-			bc = btmp;
-			do {
-				blkoff = (off_t)le32toh(bc->idx) * f->bs;
-				if (curoff < blkoff) bc--;
-				else break;
-			} while (bc >= bf && le32toh(bc->hash) == hash);
-		}
-		if (curoff == blkoff) {
+		match_offset(f->blocks, f->bc, f->bs, bcur, curoff, &blkoff);
+		/* add to current dedupe if contiguous block found */
+		if ((off_t)xi->rgi->dest_offset + xi->dedup_pending == o
+			&& curoff == blkoff) {
 			xi->dedup_pending += (off_t)bs;
 			return 1;
 		}
-		bc = btmp;
+	} else {
+		/* match smallest offset if different file */
+		match_offset(f->blocks, f->bc, f->bs, bcur, 0, &blkoff);
 	}
 	flush_dedupe(xi);
-	/* start with the smallest offset */
-	while (bc > bf && le32toh((bc - 1)->hash) == hash) bc--;
-	xi->rg->src_offset = (__u64)((off_t)le32toh(bc->idx) * f->bs);
+	xi->rg->src_offset = (__u64)blkoff;
 	xi->rgi->dest_offset = (__u64)o;
 	xi->dedup_pending = (off_t)bs;
 	/* set current, and put it at the front of the list */
