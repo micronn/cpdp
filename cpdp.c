@@ -743,7 +743,7 @@ static void init_xfer(struct xferinfo *xi,
 	xi->tmstart = xi->tmlast = time(NULL);
 #ifdef WITH_DEDUPE 
 	xi->bs = bs;
-	xi->deduped = xi->dedup_pending = 0;
+	xi->deduped = xi->dedup_pending = xi->dedup_found = 0;
 	if (fdp != NULL) while (fdp->prev != NULL) fdp = fdp->prev;
 	xi->fdplist = fdp;
 	xi->fdp = NULL;
