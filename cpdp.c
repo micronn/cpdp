@@ -886,7 +886,8 @@ next:
 	return list;
 }
 
-/* flushes pending dedupe operations of xi
+/* flushes pending dedupe operations of xi if at
+ * least MIN_DEDUPE_BYTES are pending deduplication
  */
 static void flush_dedupe(struct xferinfo *xi)
 {
@@ -898,7 +899,7 @@ static void flush_dedupe(struct xferinfo *xi)
 		return;
 	}
 	if (xi->dedup_pending < MIN_DEDUPE_BYTES)
-		goto end;
+		return;
 	if (validate_file(xi->fdp, xi->fdplist) != 1) {
 		xi->fdp = NULL;
 		xi->dedup_pending = 0;
