@@ -841,7 +841,7 @@ static int free_last_file_blocks(struct file *list)
 		list = list->next;
 	}
 	if (fc != NULL) {
-		if (free_blocks(list) == -1) return -1;
+		if (free_blocks(fc) == -1) return -1;
 		return 1;
 	}
 	return 0;
