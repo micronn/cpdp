@@ -7,7 +7,6 @@
  * Copies files, trying to sparse and deduplicate them, and prints copy stats.
  * Deduplication information comes from a database created in previous copies.
  * The tool tries to deduplicate contiguous blocks, to avoid lots of extents.
- * You may add database update without copy for existing files, if you dare.
  * There is missing functionality and it probably needs lots of checks. For
  * example, the database saves file's mtime, which may be used to see if the
  * file is changed and recalculate its blocks, or to deprioritize it when
@@ -657,6 +656,7 @@ static off_t load_files_cb(ssize_t n, off_t o, size_t es, void *e, void *p)
 	struct fentry *fe = (struct fentry *)e;
 	struct floadstat *s = (struct floadstat *)p;
 	if (n == 0) s->first = s->last = NULL;
+	if (*fe->realpath == 0) return 0;
 	if ((uint64_t)le32toh(fe->bc) * sizeof(struct block) > SIZE_MAX) {
 		if (s->report)
 			fprintf(stderr, "%s: too many blocks\n", fe->realpath);
@@ -1039,6 +1039,7 @@ static void update_xfer(struct xferinfo *xi, ssize_t xfered, int end)
 }
 
 /* transfers blocks of size bs from srcfd to dstfd
+ * or just reads the blocks from srcfd if dstfd == -1
  * prints transfer statistics to stderr every few blocks
  * total is a hint about the total bytes to transfer (-1 if unknown)
  * if fout != NULL, computed block information will be assigned to fout
@@ -1073,6 +1074,7 @@ int transfer(int srcfd, int dstfd, off_t total, blksize_t bs,
 		for (z = 0; z < (size_t)nr && buf[z] == 0; z++);
 		if (z < (size_t)nr) {
 			hash = XXH32(buf, (size_t)nr, 0);
+			if (dstfd == -1) goto nowrite;
 			if (splen != 0) {
 				if (lseek(dstfd, splen, SEEK_CUR) == -1) {
 					perror("sparsing data");
@@ -1090,6 +1092,7 @@ int transfer(int srcfd, int dstfd, off_t total, blksize_t bs,
 			/* do not keep lots of queued dedupe data */
 			if ((idx & 0xFFFF) == 0xFFFF) flush_dedupe(&xi);
 #endif
+nowrite:
 			if (bf != NULL && (size_t)nr == (size_t)bs) {
 				blk.idx = htole32(idx);
 				blk.hash = htole32((uint32_t)hash);
@@ -1110,7 +1113,7 @@ int transfer(int srcfd, int dstfd, off_t total, blksize_t bs,
 		perror("reading data");
 		goto err;
 	} else {
-		if (ftruncate(dstfd, xi.xfered) == -1) {
+		if (dstfd != -1 && ftruncate(dstfd, xi.xfered) == -1) {
 			perror("setting file size");
 			goto err;
 		}
@@ -1147,6 +1150,7 @@ end:
 }
 
 /* copies src file to dst
+ * if dst == NULL, just reads data from src (which must be a regular file)
  * if fdp != NULL, tries to dedupe with the files in fdp list
  * fdp may point to any element of the list, and the list may be
  * rearranged during the copy
@@ -1159,75 +1163,124 @@ int copy_file(const char *src, const char *dst,
 	struct stat st;
 	off_t total;
 	blksize_t bs;
-	int srcfd, dstfd, r;
+	int srcfd, dstfd = -1, r;
 	mode_t mode;
 	if ((srcfd = open(src, O_RDONLY)) == -1) {
 		perror(src);
-		return -1;
+		goto err;
 	}
 	if (fstat(srcfd, &st) == -1) {
 		perror(src);
-		close(srcfd);
-		return -1;
+		goto err;
 	}
 	if (S_ISDIR(st.st_mode)) {
 		errno = EISDIR;
 		perror(src);
-		close(srcfd);
-		return -1;
+		goto err;
 	}
 	if (S_ISREG(st.st_mode)) {
 		mode = st.st_mode;
 		total = st.st_size;
+		bs = st.st_blksize;
 	} else {
+		/* non-regular files should not be in the database */
+		if (dst == NULL) {
+			errno = ENOTSUP;
+			perror(src);
+			goto err;
+		}
 		mode = 0666;
 		total = -1;
 	}
-	dstfd = open(dst, O_CREAT | O_EXCL | O_TRUNC | O_WRONLY, mode);
-	if (dstfd == -1) {
-		perror(dst);
-		close(srcfd);
-		return -1;
+	if (dst != NULL) {
+		dstfd = open(dst, O_CREAT | O_EXCL | O_TRUNC | O_WRONLY, mode);
+		if (dstfd == -1) {
+			perror(dst);
+			goto err;
+		}
+		bs = fstat(dstfd, &st) == -1 ? 4096 : st.st_blksize;
 	}
-	bs = fstat(dstfd, &st) == -1 ? 4096 : st.st_blksize;
-	if (fout != NULL && init_new_file(fout, dst) == -1) {
+	if (fout != NULL && init_new_file(fout, dst != NULL? dst : src) == -1) {
 		perror(dst);
-		close(dstfd);
-		close(srcfd);
-		return -1;
+		goto err;
 	}
-	if (total != -1 && ftruncate(dstfd, total) == -1) {
+	if (dstfd != -1 && total != -1 && ftruncate(dstfd, total) == -1) {
 		perror(dst);
-		close(dstfd);
-		close(srcfd);
-		return -1;
+		goto err;
 	}
 	r = transfer(srcfd, dstfd, total, bs, fdp, fout);
 	if (fout != NULL) {
-		fout->mtime = fstat(dstfd, &st) == -1
+		fout->mtime = dstfd != -1 && fstat(dstfd, &st) == -1
 			? time(NULL)
 			: st.st_mtime;
 	}
-	close(dstfd);
-	close(srcfd);
+	goto end;
+err:
+	r = -1;
+end:
+	if (dstfd != -1) close(dstfd);
+	if (srcfd != -1) close(srcfd);
+	return r;
+}
+
+/* releases (deletes) the specified name and its blocks from fd database
+ * name must be the real path of the file
+ * reports to stderr when the file is not found
+ * returns -1 on error, 0 when file not found, 1 when file released
+ */
+int release_file(int fd, const char *name)
+{
+	struct fentry *fe;
+	assert(name != NULL);
+	off_t off;
+	int r;
+	if ((off = find_fentry(fd, name, &fe)) == -1) return -1;
+	if (off != 0) {
+		*fe->realpath = 0;
+		if (pwrite(fd, fe, sizeof *fe + 1, off) == -1)
+			goto errfe;
+		if (fe->boff != 0
+			&& release_blocks(fd, (off_t)le64toh(fe->boff)) == -1)
+			goto errfe;
+		r = 1;
+	} else {
+		fprintf(stderr, "%s: File not found in database.\n", name);
+		r = 0;
+	}
+	goto end;
+errfe:
+	r = -1;
+end:
+	free(fe);
 	return r;
 }
 
 void usage(void)
 {
 	fprintf(stderr, "syntax: cpdp [-f db] src dst\n");
+	fprintf(stderr, "        cpdp [-XU] -f db file\n");
+	fprintf(stderr, " -X  delete file from db\n");
+	fprintf(stderr, " -U  update or insert file to db\n");
 	exit(EXIT_FAILURE);
 }
+
+enum action { ACTION_COPY, ACTION_DELETE, ACTION_UPDATE };
 
 int main(int argc, char **argv)
 {
 	struct file fout;
 	struct file *files = NULL;
 	char *dbfile = NULL;
+	enum action action = ACTION_COPY;
 	int dfd, opt;
 	dfd = 0; /* gcc not smart enough */
-	while ((opt = getopt(argc, argv, "f:")) != -1) {
+	while ((opt = getopt(argc, argv, "XUf:")) != -1) {
 		switch (opt) {
+		case 'X':
+		case 'U':
+			if (action != ACTION_COPY) usage();
+			action = (opt == 'X') ? ACTION_DELETE : ACTION_UPDATE;
+			break;
 		case 'f':
 			dbfile = optarg;
 			break;
@@ -1237,18 +1290,38 @@ int main(int argc, char **argv)
 	}
 	argc -= optind;
 	argv += optind;
-	if (argc != 2) usage();
+	if (action == ACTION_COPY) {
+		if (argc != 2) usage();
+	} else {
+		if (argc != 1 || dbfile == NULL) usage();
+	}
 	if (dbfile != NULL) {
 		if ((dfd = open(dbfile, O_RDWR | O_CREAT, 0666)) == -1) {
 			perror(dbfile);
 			return EXIT_FAILURE;
 		}
-		files = load_files(dfd, R_OK, 1);
 	}
-	if (copy_file(argv[0], argv[1], files, &fout) == -1)
-		return EXIT_FAILURE;
+	switch (action) {
+		case ACTION_COPY:
+			if (dbfile != NULL) files = load_files(dfd, R_OK, 1);
+			if (copy_file(argv[0], argv[1], files, &fout) == -1)
+				return EXIT_FAILURE;
+			break;
+		case ACTION_UPDATE:
+			if (copy_file(argv[0], NULL, NULL, &fout) == -1)
+				return EXIT_FAILURE;
+			break;
+		case ACTION_DELETE:
+			if (release_file(dfd, argv[0]) == -1) {
+				perror(dbfile);
+				return EXIT_FAILURE;
+			}
+			break;
+		default:
+			assert(0 && "invalid action value");
+	}
 	if (dbfile != NULL) {
-		if (upsert_file(dfd, &fout) == -1) {
+		if (action != ACTION_DELETE && upsert_file(dfd, &fout) == -1) {
 			perror("saving file information to database");
 			return EXIT_FAILURE;
 		}
