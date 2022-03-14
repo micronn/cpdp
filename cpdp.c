@@ -1170,6 +1170,12 @@ int copy_file(const char *src, const char *dst,
 		close(srcfd);
 		return -1;
 	}
+	if (S_ISDIR(st.st_mode)) {
+		errno = EISDIR;
+		perror(src);
+		close(srcfd);
+		return -1;
+	}
 	if (S_ISREG(st.st_mode)) {
 		mode = st.st_mode;
 		total = st.st_size;
