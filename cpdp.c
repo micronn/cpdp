@@ -638,6 +638,7 @@ int free_file(struct file *f)
 struct floadstat {
 	struct file *first;
 	struct file *last;
+	char *ignorefile;
 	int amode;
 	int report;
 	int dfd;
@@ -657,6 +658,8 @@ static off_t load_files_cb(ssize_t n, off_t o, size_t es, void *e, void *p)
 	struct floadstat *s = (struct floadstat *)p;
 	if (n == 0) s->first = s->last = NULL;
 	if (*fe->realpath == 0) return 0;
+	if (s->ignorefile != NULL && !strcmp(s->ignorefile, fe->realpath))
+		return 0;
 	if ((uint64_t)le32toh(fe->bc) * sizeof(struct block) > SIZE_MAX) {
 		if (s->report)
 			fprintf(stderr, "%s: too many blocks\n", fe->realpath);
@@ -686,16 +689,21 @@ static off_t load_files_cb(ssize_t n, off_t o, size_t es, void *e, void *p)
 
 /* loads the files from fd database that pass access with the specified amode
  * if report != 0, reports access check failures
+ * if ignorefile != NULL, ignores the specified file (that must exist)
  * returns the list of files, or NULL when no files
  * you should errno = 0 and check if errno != 0 when NULL returned
  */
-struct file *load_files(int fd, int amode, int report)
+struct file *load_files(int fd, int amode, int report, const char *ignorefile)
 {
 	struct floadstat s;
 	s.first = NULL;
 	s.amode = amode;
 	s.report = report;
 	s.dfd = fd;
+	if (ignorefile != NULL) {
+		if ((s.ignorefile = realpath(ignorefile, NULL)) == NULL)
+			return NULL;
+	} else s.ignorefile = NULL;
 	if (loop_ddir(fd, 0, DIR_FILE, load_files_cb, &s) == -1) {
 		while (s.first != NULL) {
 			s.last = s.first;
@@ -703,6 +711,7 @@ struct file *load_files(int fd, int amode, int report)
 			free_file(s.last);
 		}
 	}
+	if (s.ignorefile != NULL) free(s.ignorefile);
 	return s.first;
 }
 
@@ -1040,6 +1049,7 @@ static void update_xfer(struct xferinfo *xi, ssize_t xfered, int end)
 
 /* transfers blocks of size bs from srcfd to dstfd
  * or just reads the blocks from srcfd if dstfd == -1
+ * it may also deduplicate srcfd if fdp != NULL and dstfd == -1
  * prints transfer statistics to stderr every few blocks
  * total is a hint about the total bytes to transfer (-1 if unknown)
  * if fout != NULL, computed block information will be assigned to fout
@@ -1069,11 +1079,13 @@ int transfer(int srcfd, int dstfd, off_t total, blksize_t bs,
 	splen = 0;
 	off = 0;
 	idx = 0;
+	if (dstfd == -1 && fdp != NULL) dstfd = srcfd;
 	init_xfer(&xi, dstfd, bs, total, fdp);
 	while ((nr = read(srcfd, buf, (size_t)bs)) != -1 && nr != 0) {
 		for (z = 0; z < (size_t)nr && buf[z] == 0; z++);
 		if (z < (size_t)nr) {
 			hash = XXH32(buf, (size_t)nr, 0);
+			if (dstfd == srcfd) goto nowritededup;
 			if (dstfd == -1) goto nowrite;
 			if (splen != 0) {
 				if (lseek(dstfd, splen, SEEK_CUR) == -1) {
@@ -1087,6 +1099,7 @@ int transfer(int srcfd, int dstfd, off_t total, blksize_t bs,
 				perror("writing data");
 				goto err;
 			}
+nowritededup:
 #ifdef WITH_DEDUPE
 			try_dedupe(&xi, off, (blksize_t)nr, hash);
 			/* do not keep lots of queued dedupe data */
@@ -1113,11 +1126,13 @@ nowrite:
 		perror("reading data");
 		goto err;
 	} else {
-		if (dstfd != -1 && ftruncate(dstfd, xi.xfered) == -1) {
-			perror("setting file size");
-			goto err;
+		if (dstfd != -1 && dstfd != srcfd) {
+			if (ftruncate(dstfd, xi.xfered) == -1) {
+				perror("setting file size");
+				goto err;
+			}
+			xi.sparsed += splen;
 		}
-		xi.sparsed += splen;
 #ifdef WITH_DEDUPE
 		flush_dedupe(&xi);
 #endif
@@ -1163,9 +1178,11 @@ int copy_file(const char *src, const char *dst,
 	struct stat st;
 	off_t total;
 	blksize_t bs;
-	int srcfd, dstfd = -1, r;
+	int srcmode, srcfd, dstfd = -1, r;
 	mode_t mode;
-	if ((srcfd = open(src, O_RDONLY)) == -1) {
+	/* source is read only unless trying to deduplicate the existing file */
+	srcmode = (dst == NULL && fdp != NULL) ? O_RDWR : O_RDONLY;
+	if ((srcfd = open(src, srcmode)) == -1) {
 		perror(src);
 		goto err;
 	}
@@ -1210,7 +1227,7 @@ int copy_file(const char *src, const char *dst,
 	}
 	r = transfer(srcfd, dstfd, total, bs, fdp, fout);
 	if (fout != NULL) {
-		fout->mtime = dstfd != -1 && fstat(dstfd, &st) == -1
+		fout->mtime = fstat(dst != NULL ? dstfd : srcfd, &st) == -1
 			? time(NULL)
 			: st.st_mtime;
 	}
@@ -1258,9 +1275,10 @@ end:
 void usage(void)
 {
 	fprintf(stderr, "syntax: cpdp [-f db] src dst\n");
-	fprintf(stderr, "        cpdp [-XU] -f db file\n");
+	fprintf(stderr, "        cpdp (-X | -U [-d]) -f db file\n");
 	fprintf(stderr, " -X  delete file from db\n");
 	fprintf(stderr, " -U  update or insert file to db\n");
+	fprintf(stderr, " -d   also deduplicate file\n");
 	exit(EXIT_FAILURE);
 }
 
@@ -1272,14 +1290,17 @@ int main(int argc, char **argv)
 	struct file *files = NULL;
 	char *dbfile = NULL;
 	enum action action = ACTION_COPY;
-	int dfd, opt;
+	int dfd, opt, dedupupd = 0;
 	dfd = 0; /* gcc not smart enough */
-	while ((opt = getopt(argc, argv, "XUf:")) != -1) {
+	while ((opt = getopt(argc, argv, "XUdf:")) != -1) {
 		switch (opt) {
 		case 'X':
 		case 'U':
 			if (action != ACTION_COPY) usage();
 			action = (opt == 'X') ? ACTION_DELETE : ACTION_UPDATE;
+			break;
+		case 'd':
+			dedupupd = 1;
 			break;
 		case 'f':
 			dbfile = optarg;
@@ -1290,6 +1311,12 @@ int main(int argc, char **argv)
 	}
 	argc -= optind;
 	argv += optind;
+	if (dedupupd && action != ACTION_UPDATE) usage();
+#ifdef NODEDUPE
+	if (dedupupd)
+		fprintf(stderr,
+			"Warning: compiled with NODEDUPE. Won't dedupe!\n");
+#endif
 	if (action == ACTION_COPY) {
 		if (argc != 2) usage();
 	} else {
@@ -1303,12 +1330,14 @@ int main(int argc, char **argv)
 	}
 	switch (action) {
 		case ACTION_COPY:
-			if (dbfile != NULL) files = load_files(dfd, R_OK, 1);
+			if (dbfile != NULL)
+				files = load_files(dfd, R_OK, 1, NULL);
 			if (copy_file(argv[0], argv[1], files, &fout) == -1)
 				return EXIT_FAILURE;
 			break;
 		case ACTION_UPDATE:
-			if (copy_file(argv[0], NULL, NULL, &fout) == -1)
+			if (dedupupd) files = load_files(dfd, R_OK, 1, argv[0]);
+			if (copy_file(argv[0], NULL, files, &fout) == -1)
 				return EXIT_FAILURE;
 			break;
 		case ACTION_DELETE:
