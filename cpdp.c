@@ -635,6 +635,40 @@ int free_file(struct file *f)
 	return 0;
 }
 
+/* callback to print files in loop_dentry
+ */
+static off_t print_files_cb(ssize_t n, off_t o, size_t es, void *e, void *p)
+{
+	(void)n;
+	(void)o;
+	(void)p;
+	size_t bc;
+	blksize_t bs;
+	time_t mtime;
+	struct fentry *fe = (struct fentry *)e;
+	char buf[30];
+	if (fe == NULL || es <= sizeof(*fe)) return 0;
+	if (*fe->realpath != 0) {
+		bc = (size_t)le32toh(fe->bc);
+		bs = (blksize_t)le32toh(fe->bs);
+		mtime = (time_t)le64toh(fe->mtime);
+		if (!strftime(buf, sizeof(buf), "%Ec", localtime(&mtime))) {
+			strcpy(buf, "*");
+		}
+		printf("%s %3dK %9zu %s\n",
+			buf, (int)bs/1024, bc, fe->realpath);
+	}
+	return 0;
+}
+
+/* prints to stdout all file realpaths from fd database
+ * returns -1 on error
+ */
+int print_files(int fd)
+{
+	return loop_ddir(fd, 0, DIR_FILE, print_files_cb, NULL) != 0 ? -1 : 0;
+}
+
 struct floadstat {
 	struct file *first;
 	struct file *last;
@@ -1275,14 +1309,21 @@ end:
 void usage(void)
 {
 	fprintf(stderr, "syntax: cpdp [-f db] src dst\n");
+	fprintf(stderr, "        cpdp -l -f db\n");
 	fprintf(stderr, "        cpdp (-X | -U [-d]) -f db file\n");
+	fprintf(stderr, " -l  list files from db\n");
 	fprintf(stderr, " -X  delete file from db\n");
 	fprintf(stderr, " -U  update or insert file to db\n");
 	fprintf(stderr, " -d   also deduplicate file\n");
 	exit(EXIT_FAILURE);
 }
 
-enum action { ACTION_COPY, ACTION_DELETE, ACTION_UPDATE };
+enum action {
+	ACTION_COPY,
+	ACTION_LIST = 'l',
+	ACTION_DELETE = 'X',
+	ACTION_UPDATE = 'U'
+};
 
 int main(int argc, char **argv)
 {
@@ -1290,14 +1331,15 @@ int main(int argc, char **argv)
 	struct file *files = NULL;
 	char *dbfile = NULL;
 	enum action action = ACTION_COPY;
-	int dfd, opt, dedupupd = 0;
+	int dfd, opt, dbmode, dedupupd = 0;
 	dfd = 0; /* gcc not smart enough */
-	while ((opt = getopt(argc, argv, "XUdf:")) != -1) {
+	while ((opt = getopt(argc, argv, "lXUdf:")) != -1) {
 		switch (opt) {
+		case 'l':
 		case 'X':
 		case 'U':
 			if (action != ACTION_COPY) usage();
-			action = (opt == 'X') ? ACTION_DELETE : ACTION_UPDATE;
+			action = (enum action)opt;
 			break;
 		case 'd':
 			dedupupd = 1;
@@ -1319,11 +1361,14 @@ int main(int argc, char **argv)
 #endif
 	if (action == ACTION_COPY) {
 		if (argc != 2) usage();
-	} else {
+	} else if (action != ACTION_LIST) {
 		if (argc != 1 || dbfile == NULL) usage();
+	} else {
+		if (argc != 0 || dbfile == NULL) usage();
 	}
 	if (dbfile != NULL) {
-		if ((dfd = open(dbfile, O_RDWR | O_CREAT, 0666)) == -1) {
+		dbmode = (action == ACTION_LIST) ? O_RDONLY : O_RDWR | O_CREAT;
+		if ((dfd = open(dbfile, dbmode, 0666)) == -1) {
 			perror(dbfile);
 			return EXIT_FAILURE;
 		}
@@ -1334,6 +1379,9 @@ int main(int argc, char **argv)
 				files = load_files(dfd, R_OK, 1, NULL);
 			if (copy_file(argv[0], argv[1], files, &fout) == -1)
 				return EXIT_FAILURE;
+			break;
+		case ACTION_LIST:
+			if (print_files(dfd) == -1) return EXIT_FAILURE;
 			break;
 		case ACTION_UPDATE:
 			if (dedupupd) files = load_files(dfd, R_OK, 1, argv[0]);
@@ -1350,7 +1398,8 @@ int main(int argc, char **argv)
 			assert(0 && "invalid action value");
 	}
 	if (dbfile != NULL) {
-		if (action != ACTION_DELETE && upsert_file(dfd, &fout) == -1) {
+		if ((action == ACTION_UPDATE || action == ACTION_COPY)
+			&& upsert_file(dfd, &fout) == -1) {
 			perror("saving file information to database");
 			return EXIT_FAILURE;
 		}
