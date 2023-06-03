@@ -41,7 +41,6 @@
 #endif
 
 #include <assert.h>
-#include <ctype.h>
 #include <endian.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -1199,12 +1198,13 @@ end:
 	return r;
 }
 
-/* copies src file to dst
+/* copies src file to dst using tbs block size
  * if dst == NULL, just reads data from src (which must be a regular file)
  * if fdp != NULL, tries to dedupe with the files in fdp list
  * fdp may point to any element of the list, and the list may be
  * rearranged during the copy
  * if fout != NULL, fills it with file information and its blocks
+ * if tbs <= 0, i/o block size of destination file's filesystem will be used
  * returns -1 on error
  */
 int copy_file(const char *src, const char *dst,
