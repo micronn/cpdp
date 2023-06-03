@@ -41,6 +41,7 @@
 #endif
 
 #include <assert.h>
+#include <ctype.h>
 #include <endian.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -1207,7 +1208,8 @@ end:
  * returns -1 on error
  */
 int copy_file(const char *src, const char *dst,
-		struct file *fdp, struct file *fout)
+		struct file *fdp, struct file *fout,
+	     	blksize_t tbs)
 {
 	struct stat st;
 	off_t total;
@@ -1259,7 +1261,8 @@ int copy_file(const char *src, const char *dst,
 		perror(dst);
 		goto err;
 	}
-	r = transfer(srcfd, dstfd, total, bs, fdp, fout);
+	if (tbs <= 0) tbs = bs;
+	r = transfer(srcfd, dstfd, total, tbs, fdp, fout);
 	if (fout != NULL) {
 		fout->mtime = fstat(dst != NULL ? dstfd : srcfd, &st) == -1
 			? time(NULL)
@@ -1308,9 +1311,10 @@ end:
 
 void usage(void)
 {
-	fprintf(stderr, "syntax: cpdp [-f db] src dst\n");
+	fprintf(stderr, "syntax: cpdp [-b bs] [-f db] src dst\n");
 	fprintf(stderr, "        cpdp -l -f db\n");
-	fprintf(stderr, "        cpdp (-X | -U [-d]) -f db file\n");
+	fprintf(stderr, "        cpdp [-b bs] (-X | -U [-d]) -f db file\n");
+	fprintf(stderr, " -b  set block size to bs bytes (KiB if k suffix)\n");
 	fprintf(stderr, " -l  list files from db\n");
 	fprintf(stderr, " -X  delete file from db\n");
 	fprintf(stderr, " -U  update or insert file to db\n");
@@ -1329,12 +1333,31 @@ int main(int argc, char **argv)
 {
 	struct file fout;
 	struct file *files = NULL;
-	char *dbfile = NULL;
+	char *dbfile = NULL, *suffix;
+	blksize_t tbs = 0;
 	enum action action = ACTION_COPY;
 	int dfd, opt, dbmode, dedupupd = 0;
 	dfd = 0; /* gcc not smart enough */
-	while ((opt = getopt(argc, argv, "lXUdf:")) != -1) {
+	while ((opt = getopt(argc, argv, "b:lXUdf:")) != -1) {
 		switch (opt) {
+		case 'b':
+			tbs = (blksize_t)strtoll(optarg, &suffix, 10);
+			switch (*suffix) {
+			case '\0':
+				break;
+			case 'K':
+			case 'k':
+				tbs <<= 10;
+				break;
+			default:
+				tbs = 0;
+			}
+			if (tbs <= 0) {
+				fprintf(stderr,
+					"warning: invalid block specification - "
+					"using default\n");
+			}
+			break;
 		case 'l':
 		case 'X':
 		case 'U':
@@ -1377,7 +1400,7 @@ int main(int argc, char **argv)
 		case ACTION_COPY:
 			if (dbfile != NULL)
 				files = load_files(dfd, R_OK, 1, NULL);
-			if (copy_file(argv[0], argv[1], files, &fout) == -1)
+			if (copy_file(argv[0], argv[1], files, &fout, tbs)== -1)
 				return EXIT_FAILURE;
 			break;
 		case ACTION_LIST:
@@ -1385,7 +1408,7 @@ int main(int argc, char **argv)
 			break;
 		case ACTION_UPDATE:
 			if (dedupupd) files = load_files(dfd, R_OK, 1, argv[0]);
-			if (copy_file(argv[0], NULL, files, &fout) == -1)
+			if (copy_file(argv[0], NULL, files, &fout, tbs) == -1)
 				return EXIT_FAILURE;
 			break;
 		case ACTION_DELETE:
