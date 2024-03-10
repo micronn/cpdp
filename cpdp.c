@@ -13,9 +13,35 @@
  * considering the file for deduplication. But by now it does nothing.
  * Note there are no locks nor version control in its grotesque database!
  * @micronn Oct 2021 (oh, yeah, all-code-in-one-file, aaarrrrgghhhh)
+ * 
+ * To clarify: this tool is for deduplicating large amounts of data which may
+ * come from a file, network... with a few files as deduplication source, and
+ * not for filesystems with lots of files. Just a few. Performance degrades
+ * considerably when the database contains many files. Compile with -O3, and
+ * you can also adjust MIN_SIZE_MMAP or have a process that reads the database
+ * every few minutes to have it in cache. As I said, this is for a specific
+ * use case, but it may work for you too if you know what you're doing.
+ * 
+ * 20240307: This monstruosity grew a bit, and now is able to use FICLONERANGE
+ * which is way faster than FIDEDUPERANGE. But be sure to understand that this
+ * is not an atomic deduplication (if the file from which the block is being
+ * deduplicated changes while doing the deduplication, it may get the new data
+ * and produce a corrupt copy). So, this is only enabled if -c option is
+ * specified. You can use -c if you're sure that the source blocks are not
+ * being changed while this program is deduplicating.
+ * 
+ * Now it is also able to punch holes when deduplicating an existing file.
  */
 
 #define _DEFAULT_SOURCE
+
+#ifdef __linux__
+	#include <linux/version.h>
+	#if LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 38)
+		#define _GNU_SOURCE
+		#define WITH_PUNCH_HOLE
+	#endif
+#endif
 
 #include <sys/types.h>
 #include <sys/stat.h>
@@ -41,6 +67,7 @@
 #endif
 
 #include <assert.h>
+#include <ctype.h>
 #include <endian.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -57,8 +84,13 @@
 /* don't try to dedupe less than 256 KiB */
 #define MIN_DEDUPE_BYTES	0x40000
 
+/* don't queue more than 16 MiB */
+#define MAX_QUEUED_BYTES	0x1000000
+
 /* will use mmap to read blocks from db when there are > 16 MiB in blocks */
 #define MIN_SIZE_MMAP		0x1000000
+
+static int enableclone;
 
 /* the database is just a bunch of 4K-multiple blocks
  * some blocks represent file blocks (hash and block index in file)
@@ -224,8 +256,8 @@ int add_dentry(int fd, off_t pos, uint16_t dt, uint16_t es, void *e)
 		}
 	}
 	if (!eo) {
-	       if (add_ddir(fd, pos, dt, es, &pos, &d) == -1) return -1;
-	       eo = sizeof d;
+		if (add_ddir(fd, pos, dt, es, &pos, &d) == -1) return -1;
+		eo = sizeof d;
 	}
 	if (pwrite(fd, e, es, pos + eo) != es) return -1;
 	d.ef--;
@@ -516,7 +548,7 @@ int free_blocks(struct file *f)
 	if (f->blocks == NULL) return 0;
 	size_t s = f->bc * sizeof *f->blocks;
 	if (f->boff != 0 && f->bc != 0 && s >= MIN_SIZE_MMAP) {
-	       	if (munmap(f->blocks, s) == -1) return -1;
+		if (munmap(f->blocks, s) == -1) return -1;
 	} else {
 		free(f->blocks);
 	}
@@ -757,15 +789,24 @@ struct xferinfo {
 	double xfersec;		/* bytes transferred per second */
 	time_t tmstart;		/* time when the transfer started */
 	time_t tmlast;		/* time of the last update */
+	int dstfd;		/* destination file */
+	int nowrite;		/* non-zero to disable write */
 #ifdef WITH_DEDUPE
 	blksize_t bs;		/* block size */
 	off_t deduped;		/* total deduplicated bytes */
 	off_t dedup_pending;	/* total bytes pending deduplication */
 	off_t dedup_found;	/* total bytes found to deduplicate */
+	off_t cloneoff;		/* destination offset for clone operation */
+	off_t cloned;		/* total bytes cloned */
+	size_t clonemax;	/* max number of bytes for clone */
+	size_t clonelen;	/* length to clone */
+	char *clonedata;	/* bytes to clone */
 	struct file *fdplist;	/* start of the file list for deduplication */
 	struct file *fdp;	/* current file from which to deduplicate */
+	struct file_clone_range crg;
 	struct file_dedupe_range *rg;
 	struct file_dedupe_range_info *rgi;
+	_Alignas(struct file_dedupe_range)
 	char rgbuf[sizeof(struct file_dedupe_range) +
 		sizeof(struct file_dedupe_range_info)];
 #endif
@@ -784,7 +825,15 @@ static void init_xfer(struct xferinfo *xi,
 	xi->sparsed = 0;
 	xi->xfersec = 0.0;
 	xi->tmstart = xi->tmlast = time(NULL);
+	xi->dstfd = dstfd;
+	xi->nowrite = 1;
 #ifdef WITH_DEDUPE 
+	xi->cloneoff = xi->cloned = 0;
+	xi->clonemax = xi->clonelen = 0;
+	if (enableclone && (xi->clonedata = malloc(MAX_QUEUED_BYTES)) != NULL)
+		xi->clonemax = MAX_QUEUED_BYTES;
+	else
+		xi->clonedata = NULL;
 	xi->bs = bs;
 	xi->deduped = xi->dedup_pending = xi->dedup_found = 0;
 	if (fdp != NULL) while (fdp->prev != NULL) fdp = fdp->prev;
@@ -796,7 +845,6 @@ static void init_xfer(struct xferinfo *xi,
 	xi->rg->dest_count = 1;
 	xi->rgi->dest_fd = dstfd;
 #else
-	(void)dstfd;
 	(void)bs;
 	(void)fdp;
 #endif
@@ -810,12 +858,18 @@ static inline void print_xferstats(struct xferinfo *xi)
 	const float mb = (float)((off_t)1<<20);
 	const float gb = (float)((off_t)1<<30);
 	fprintf(stderr, " %.2f", (float)xi->xfered / gb);
-	if (xi->total >= 0) {
+	if (xi->total >= 0)
 		fprintf(stderr, "/%.2f", (float)xi->total / gb);
-	}
+#ifdef WITH_PUNCH_HOLE
 	fprintf(stderr, " (S %.2f", (float)xi->sparsed / gb);
+#else
+	fprintf(stderr, " (%c %.2f", xi->nowrite ? 's' : 'S',
+		(float)xi->sparsed / gb);
+#endif
 #ifdef WITH_DEDUPE
 	fprintf(stderr, ", D %.2f", (float)xi->deduped / gb);
+	fprintf(stderr, ", %c %.2f", xi->clonemax ? 'C' : 'c',
+		(float)xi->cloned / gb);
 	fprintf(stderr, " d %.2f", (float)xi->dedup_found / gb);
 #endif
 	fprintf(stderr, ") GB [%.2f MB/s]", (float)xi->xfersec / mb);
@@ -902,24 +956,24 @@ static struct file *find_valid_block(struct file *list,
 	struct block *b = NULL;
 	struct file *first = list;
 	while (list != NULL) {
-		if (list->bs != bs)
+		if (list->bs != bs || list->valid < 0)
 			goto next;
-		if (list->valid == 0 && validate_file(list, first) != 1)
-			goto next;
-		if (list->valid > 0) {
 try_ensure:
-			if (ensure_blocks(list) == -1) {
-				if (errno == ENOMEM
-					&& free_last_file_blocks(first) == 1)
-					goto try_ensure;
-				goto next;
-			}
-			if (list->blocks == NULL)
-				goto next;
-			b = bsearch(&hash,
-				list->blocks, list->bc, sizeof *list->blocks,
-				block_search);
-			if (b != NULL)
+		if (ensure_blocks(list) == -1) {
+			if (errno == ENOMEM
+				&& free_last_file_blocks(first) == 1)
+				goto try_ensure;
+			goto next;
+		}
+		if (list->blocks == NULL)
+			goto next;
+		b = bsearch(&hash,
+			list->blocks, list->bc, sizeof *list->blocks,
+			block_search);
+		if (b != NULL) {
+			if (!list->valid && validate_file(list, first) != 1)
+				b = NULL;
+			else
 				break;
 		}
 next:
@@ -929,26 +983,105 @@ next:
 	return list;
 }
 
-/* flushes pending dedupe operations of xi if at
- * least MIN_DEDUPE_BYTES are pending deduplication
+enum { CLONED_NONE, CLONED_ALL, CLONED_SOME };
+
+/* verifies if dedupe data matches and perfoms the clone ioctl
+ * on some success, returns the corresponding CLONED_* constant
+ * returns -1 if ioctl failed
+ * note:
+ *  if clonelen > dedup_pending it found some dedupe data but not last block
+ *  dedup_pending > clonelen should not happen
  */
-static void flush_dedupe(struct xferinfo *xi)
+static inline int perform_clone(struct xferinfo *xi)
+{
+	struct file_clone_range *crg = &xi->crg;
+	struct file_dedupe_range *rg = xi->rg;
+	struct file_dedupe_range_info *rgi = xi->rgi;
+	off_t os, oc, len;
+	ssize_t nr;
+	int srcfd = xi->fdp->fd;
+	char buf[xi->bs];
+	len = (off_t)xi->clonelen;
+	if ((__u64)xi->cloneoff != xi->rgi->dest_offset
+		|| len < xi->dedup_pending) {
+		return CLONED_NONE;
+	}
+	if (len > xi->dedup_pending) len = xi->dedup_pending;
+	oc = nr = 0;
+	os = (off_t)xi->rg->src_offset;
+	while (oc < len
+		&& (nr = pread(srcfd, buf, (size_t)xi->bs, os + oc)) != -1
+		&& nr != 0) {
+		if (len - oc < nr) nr = len - oc;
+		if (memcmp(buf, xi->clonedata + oc, (size_t)nr) != 0) {
+			return CLONED_NONE;
+		}
+		oc += nr;
+	}
+	if (nr == -1 || oc < len) return CLONED_NONE;
+	crg->src_fd = srcfd;
+	crg->src_offset = xi->rg->src_offset;
+	crg->src_length = (__u64)len;
+	crg->dest_offset = (__u64)xi->cloneoff;
+	if (ioctl(xi->dstfd, FICLONERANGE, crg) == -1) return -1;
+	rg->src_offset += (__u64)len;
+	rgi->dest_offset += (__u64)len;
+	xi->cloneoff += len;
+	xi->dedup_pending -= len;
+	xi->cloned += len;
+	if (xi->clonelen != (size_t)len) {
+		memcpy(xi->clonedata, xi->clonedata + (size_t)len,
+			xi->clonelen - (size_t)len);
+		xi->clonelen -= (size_t)len;
+		return CLONED_SOME;
+	}
+	xi->clonelen = 0;
+	return CLONED_ALL;
+}
+
+/* writes pending queued clone data (if transfer nowrite is 0)
+ * if at least MIN_DEDUPE_BYTES are pending deduplication, performs the
+ * clone or dedupe operation
+ * returns -1 if write failed
+ */
+static int flush_dedupe(struct xferinfo *xi)
 {
 	assert(xi != NULL);
 	struct file_dedupe_range *rg = xi->rg;
 	struct file_dedupe_range_info *rgi = xi->rgi;
-	if (xi->fdp == NULL) {
+	int ok = 1, cloned = CLONED_NONE;
+	if (ok && xi->fdp == NULL) {
 		xi->dedup_pending = 0;
-		return;
+		ok = 0;
 	}
-	if (xi->dedup_pending < MIN_DEDUPE_BYTES)
-		return;
-	if (validate_file(xi->fdp, xi->fdplist) != 1) {
+	if (ok && xi->dedup_pending < MIN_DEDUPE_BYTES)
+		ok = 0;
+	if (ok && validate_file(xi->fdp, xi->fdplist) != 1) {
 		xi->fdp = NULL;
 		xi->dedup_pending = 0;
-		return;
+		ok = 0;
 	}
-	while (xi->dedup_pending > 0) {
+	if (xi->clonelen > 0) {
+		if (ok && (cloned = perform_clone(xi)) == -1) {
+			/* disable clone functionality if ioctl failure */
+			xi->clonemax = 0;
+			cloned = CLONED_NONE;
+		}
+		if (cloned != CLONED_ALL) {
+			/* did not clone all, so we need to write rest */
+			if (!xi->nowrite && pwrite(xi->dstfd,
+				xi->clonedata,
+				xi->clonelen,
+				xi->cloneoff) != (ssize_t)xi->clonelen) {
+				perror("writing data");
+				return -1;
+			}
+			xi->clonelen = 0;
+			/* don't try to dedupe */
+			ok = 0;
+		}
+	}
+	while (ok && xi->dedup_pending > 0) {
 		rg->src_length = (__u64)xi->dedup_pending;
 		rg->reserved1 = 0;
 		rg->reserved2 = 0;
@@ -968,6 +1101,7 @@ end:
 		rgi->dest_offset += (__u64)xi->dedup_pending;
 	}
 	xi->dedup_pending = 0;
+	return 0;
 }
 
 /* given a sorted blocks array with bc blocks of size bs, a bcur current
@@ -1010,14 +1144,20 @@ static inline void match_offset(
 }
 
 /* tries to deduplicate the block at offset o, size siz, and specified hash
+ * note: it may write pending queued clone data
  * returns 0 if block not found in candidate file list, 1 if found
+ * returns -1 if write pending data failed
  */
 static int try_dedupe(struct xferinfo *xi, off_t o, blksize_t bs, uint32_t hash)
 {
 	assert(xi != NULL);
+	assert(bs > 0);
 	struct file *f;
 	struct block *bcur;
-	off_t blkoff, curoff;
+	off_t blkoff, curoff, clooff;
+	size_t cbs = 0;
+	int r = 1;
+	char buf[(size_t)bs];
 	if (xi->bs != bs)
 		return 0;
 	if ((f = find_valid_block(xi->fdplist, bs, hash, &bcur)) == NULL)
@@ -1036,7 +1176,21 @@ static int try_dedupe(struct xferinfo *xi, off_t o, blksize_t bs, uint32_t hash)
 		/* match smallest offset if different file */
 		match_offset(f->blocks, f->bc, f->bs, bcur, 0, &blkoff);
 	}
-	flush_dedupe(xi);
+	if (xi->dedup_pending > 0) {
+		/* don't flush the last clone block: it's this */
+		if (xi->clonelen > (size_t)bs) {
+			cbs = (size_t)bs;
+			xi->clonelen -= cbs;
+			clooff = xi->cloneoff + (off_t)xi->clonelen;
+			memcpy(buf, xi->clonedata + xi->clonelen, cbs);
+		}
+		if(flush_dedupe(xi) == -1) r = -1;
+		else if(cbs > 0) {
+			memcpy(xi->clonedata, buf, cbs);
+			xi->clonelen = cbs;
+			xi->cloneoff = clooff;
+		}
+	}
 	xi->rg->src_offset = (__u64)blkoff;
 	xi->rgi->dest_offset = (__u64)o;
 	xi->dedup_pending = (off_t)bs;
@@ -1046,11 +1200,11 @@ static int try_dedupe(struct xferinfo *xi, off_t o, blksize_t bs, uint32_t hash)
 		if (f->prev != NULL) f->prev->next = f->next;
 		if (f->next != NULL) f->next->prev = f->prev;
 		f->prev = NULL;
-	       	f->next = xi->fdplist;
+		   	f->next = xi->fdplist;
 		xi->fdplist->prev = f;
 		xi->fdplist = f;
 	}
-	return 1;
+	return r;
 }
 
 #endif
@@ -1058,6 +1212,7 @@ static int try_dedupe(struct xferinfo *xi, off_t o, blksize_t bs, uint32_t hash)
 /* updates transfer statistics, accumulating xfered bytes to total transferred,
  * calculates transfer rate and prints transfer stats to stderr every few calls.
  * if end != 0, calculates transfer stats and prints them to stderr, with a \n
+ * and releases clone buffer
  */
 static void update_xfer(struct xferinfo *xi, ssize_t xfered, int end)
 {
@@ -1075,15 +1230,53 @@ static void update_xfer(struct xferinfo *xi, ssize_t xfered, int end)
 		}
 		print_xferstats(xi);
 		if (end) {
+#ifdef WITH_DEDUPE
+			free(xi->clonedata);
+			xi->clonedata = NULL;
+#endif
 			fprintf(stderr, "\n");
 			upd = 0;
 		}
 	}
 }
 
+/* if no deduplication supported, writes the buf with len to xi dest file
+ * at the specified offset off if xi nowrite is 0; else, appends to
+ * queue clone data the speficied buf with len. Does the clone/write 
+ * operation before arriving at clonemax data size, or if the offset is
+ * not contiguous
+ * returns -1 on error, 0 on success
+ */
+static int clone_append(struct xferinfo *xi, off_t off, char *buf, size_t len)
+{
+#ifdef WITH_DEDUPE
+	if (xi->clonemax != 0 && len <= xi->clonemax) {
+		if (xi->clonelen == 0) xi->cloneoff = off;
+		if (xi->clonemax - len < xi->clonelen
+			|| xi->cloneoff + (off_t)xi->clonelen != off) {
+			if (flush_dedupe(xi) == -1) return -1;
+			xi->cloneoff = off;
+		}
+		memcpy(&xi->clonedata[xi->clonelen], buf, len);
+		xi->clonelen += len;
+	} else {
+		if (xi->clonelen > 0 && flush_dedupe(xi) == -1)
+			return -1;
+#endif
+		if (!xi->nowrite
+			&& pwrite(xi->dstfd, buf, len, off) != (ssize_t)len) {
+			perror("writing data");
+			return -1;
+		}
+#ifdef WITH_DEDUPE
+	}
+#endif
+	return 0;
+}
+
 /* transfers blocks of size bs from srcfd to dstfd
  * or just reads the blocks from srcfd if dstfd == -1
- * it may also deduplicate srcfd if fdp != NULL and dstfd == -1
+ * it may also deduplicate and punch srcfd if fdp != NULL and dstfd == -1
  * prints transfer statistics to stderr every few blocks
  * total is a hint about the total bytes to transfer (-1 if unknown)
  * if fout != NULL, computed block information will be assigned to fout
@@ -1102,7 +1295,7 @@ int transfer(int srcfd, int dstfd, off_t total, blksize_t bs,
 	FILE *bf;
 	off_t off, splen;
 	size_t bfbytes, bflen, z;
-	ssize_t nr, nw;
+	ssize_t nr;
 	int r;
 	uint32_t idx;
 	XXH32_hash_t hash;
@@ -1115,31 +1308,36 @@ int transfer(int srcfd, int dstfd, off_t total, blksize_t bs,
 	idx = 0;
 	if (dstfd == -1 && fdp != NULL) dstfd = srcfd;
 	init_xfer(&xi, dstfd, bs, total, fdp);
+	xi.nowrite = dstfd == -1 || dstfd == srcfd;
 	while ((nr = read(srcfd, buf, (size_t)bs)) != -1 && nr != 0) {
 		for (z = 0; z < (size_t)nr && buf[z] == 0; z++);
 		if (z < (size_t)nr) {
 			hash = XXH32(buf, (size_t)nr, 0);
-			if (dstfd == srcfd) goto nowritededup;
-			if (dstfd == -1) goto nowrite;
+			if (dstfd == -1) goto nodedup;
 			if (splen != 0) {
-				if (lseek(dstfd, splen, SEEK_CUR) == -1) {
-					perror("sparsing data");
-					goto err;
+				if (xi.nowrite) {
+#ifdef WITH_PUNCH_HOLE
+					if (fallocate(dstfd,
+						FALLOC_FL_KEEP_SIZE
+						| FALLOC_FL_PUNCH_HOLE,
+						off - splen, splen) != -1)
+						xi.sparsed += splen;
+#endif
+				} else {
+					xi.sparsed += splen;
 				}
-				xi.sparsed += splen;
 				splen = 0;
 			}
-			if ((nw = write(dstfd, buf, (size_t)nr)) != nr) {
-				perror("writing data");
+			if (clone_append(&xi, off, buf, (size_t)nr) == -1)
 				goto err;
-			}
-nowritededup:
 #ifdef WITH_DEDUPE
-			try_dedupe(&xi, off, (blksize_t)nr, hash);
+			if (try_dedupe(&xi, off, (blksize_t)nr, hash) == -1)
+				goto err;
 			/* do not keep lots of queued dedupe data */
-			if ((idx & 0xFFFF) == 0xFFFF) flush_dedupe(&xi);
+			if (xi.dedup_pending >= MAX_QUEUED_BYTES)
+				if (flush_dedupe(&xi) == -1) goto err;
 #endif
-nowrite:
+nodedup:
 			if (bf != NULL && (size_t)nr == (size_t)bs) {
 				blk.idx = htole32(idx);
 				blk.hash = htole32((uint32_t)hash);
@@ -1160,15 +1358,25 @@ nowrite:
 		perror("reading data");
 		goto err;
 	} else {
-		if (dstfd != -1 && dstfd != srcfd) {
-			if (ftruncate(dstfd, xi.xfered) == -1) {
-				perror("setting file size");
-				goto err;
+		if (dstfd != -1 ) {
+			if (dstfd != srcfd) {
+				if (ftruncate(dstfd, xi.xfered) == -1) {
+					perror("setting file size");
+					goto err;
+				}
+				xi.sparsed += splen;		
+			} else {
+#ifdef WITH_PUNCH_HOLE
+				if (splen != 0 && fallocate(dstfd,
+					FALLOC_FL_KEEP_SIZE
+					| FALLOC_FL_PUNCH_HOLE,
+					xi.xfered - splen, splen) != -1)
+					xi.sparsed += splen;
+#endif
 			}
-			xi.sparsed += splen;
 		}
 #ifdef WITH_DEDUPE
-		flush_dedupe(&xi);
+		if (flush_dedupe(&xi) == -1) goto err;
 #endif
 		update_xfer(&xi, 0, 1);
 		if (bf != NULL) {
@@ -1198,18 +1406,17 @@ end:
 	return r;
 }
 
-/* copies src file to dst using tbs block size
+/* copies src file to dst
  * if dst == NULL, just reads data from src (which must be a regular file)
  * if fdp != NULL, tries to dedupe with the files in fdp list
  * fdp may point to any element of the list, and the list may be
  * rearranged during the copy
  * if fout != NULL, fills it with file information and its blocks
- * if tbs <= 0, i/o block size of destination file's filesystem will be used
  * returns -1 on error
  */
 int copy_file(const char *src, const char *dst,
 		struct file *fdp, struct file *fout,
-	     	blksize_t tbs)
+		blksize_t tbs)
 {
 	struct stat st;
 	off_t total;
@@ -1311,9 +1518,10 @@ end:
 
 void usage(void)
 {
-	fprintf(stderr, "syntax: cpdp [-b bs] [-f db] src dst\n");
+	fprintf(stderr, "syntax: cpdp [-b bs] [-c] [-f db] src dst\n");
 	fprintf(stderr, "        cpdp -l -f db\n");
-	fprintf(stderr, "        cpdp [-b bs] (-X | -U [-d]) -f db file\n");
+	fprintf(stderr, "        cpdp [-b bs] (-X | -U [-c] [-d]) -f db file\n");
+	fprintf(stderr, " -c  enable clonerange (warning: not atomic!)\n");
 	fprintf(stderr, " -b  set block size to bs bytes (KiB if k suffix)\n");
 	fprintf(stderr, " -l  list files from db\n");
 	fprintf(stderr, " -X  delete file from db\n");
@@ -1338,25 +1546,28 @@ int main(int argc, char **argv)
 	enum action action = ACTION_COPY;
 	int dfd, opt, dbmode, dedupupd = 0;
 	dfd = 0; /* gcc not smart enough */
-	while ((opt = getopt(argc, argv, "b:lXUdf:")) != -1) {
+	while ((opt = getopt(argc, argv, "cb:lXUdf:")) != -1) {
 		switch (opt) {
 		case 'b':
 			tbs = (blksize_t)strtoll(optarg, &suffix, 10);
 			switch (*suffix) {
-			case '\0':
-				break;
-			case 'K':
-			case 'k':
-				tbs <<= 10;
-				break;
-			default:
-				tbs = 0;
+				case '\0':
+					break;
+				case 'K':
+				case 'k':
+					tbs <<= 10;
+					break;
+				default:
+					tbs = 0;
 			}
 			if (tbs <= 0) {
 				fprintf(stderr,
 					"warning: invalid block specification - "
-					"using default\n");
+					"default will be used\n");
 			}
+			break;
+		case 'c':
+			enableclone = 1;
 			break;
 		case 'l':
 		case 'X':
@@ -1400,7 +1611,7 @@ int main(int argc, char **argv)
 		case ACTION_COPY:
 			if (dbfile != NULL)
 				files = load_files(dfd, R_OK, 1, NULL);
-			if (copy_file(argv[0], argv[1], files, &fout, tbs)== -1)
+			if (copy_file(argv[0], argv[1], files, &fout, tbs)==-1)
 				return EXIT_FAILURE;
 			break;
 		case ACTION_LIST:
@@ -1430,4 +1641,3 @@ int main(int argc, char **argv)
 	}
 	return EXIT_SUCCESS;
 }
-
