@@ -477,6 +477,80 @@ int release_blocks(int fd, off_t boff)
 	return 1;
 }
 
+struct copy_dbfiles_stat
+{
+	int srcdfd;
+	int dstdfd;
+	char buf[4096];
+};
+
+/* callback to copy non-deleted dbfiles from db in loop_dentry
+ */
+static off_t copy_dbfiles_cb(ssize_t n, off_t o, size_t es, void *e, void *p)
+{
+	(void)o;
+	if (n == -1) return 0;
+	struct fentry *fe = (struct fentry *)e;
+	if (*fe->realpath == 0 || fe->bc == 0) return 0;
+	struct copy_dbfiles_stat *s = (struct copy_dbfiles_stat *)p;
+	uint32_t bc = le32toh(fe->bc);
+	off_t srcboff = (off_t)le64toh(fe->boff);
+	off_t dstboff = allocate_blocks(s->dstdfd, bc);
+	if (dstboff == -1) {
+		perror("allocating blocks");
+		return -1;
+	}
+	struct fentry *nfe = malloc(es);
+	if (nfe == NULL) {
+		perror("creating new file entry");
+		return -1;
+	}
+	memcpy(nfe, fe, es);
+	nfe->boff = htole64((uint64_t)dstboff);
+	ssize_t rb, wb;
+	size_t tb, nb;
+	tb = bc * sizeof(struct block);
+	fprintf(stderr, "%s\n", nfe->realpath);
+	while (tb != 0) {
+		nb = (tb > sizeof s->buf) ? sizeof s->buf : tb;
+		if ((rb = pread(s->srcdfd, s->buf, nb, srcboff)) == -1) {
+			perror("reading blocks");
+			return free(nfe), -1;
+		}
+		if ((wb = pwrite(s->dstdfd, s->buf,
+			(size_t)rb, dstboff)) == -1) {
+			perror("writing blocks");
+			return free(nfe), -1;
+		}
+		srcboff += wb;
+		dstboff += wb;
+		tb -= (size_t)wb;
+	}
+	if (add_dentry(s->dstdfd, 0, DIR_FILE, (uint16_t)es, nfe) == -1) {
+		perror("adding file entry");
+		return free(nfe), -1;
+	}
+	return 0;
+}
+
+/* creates a new file with the name specified in dst and writes there the
+ * data about non-deleted files from dfd database
+ * returns -1 on error
+ */
+int copy_dbfiles(int dfd, const char *dst)
+{
+	struct copy_dbfiles_stat s;
+	s.srcdfd = dfd;
+	s.dstdfd = open(dst, O_CREAT | O_EXCL | O_TRUNC | O_RDWR, 0666);
+	if (s.dstdfd == -1) {
+		perror("opening destination database file");
+		return -1;
+	}
+	if (loop_ddir(dfd, 0, DIR_FILE, copy_dbfiles_cb, &s) == -1)
+		return -1;
+	return close(s.dstdfd);
+}
+
 struct file {
 	struct file *prev;	/* this is a doubly linked list */
 	struct file *next;	/* and will let us rearrange it */
@@ -1520,10 +1594,12 @@ void usage(void)
 {
 	fprintf(stderr, "syntax: cpdp [-b bs] [-c] [-f db] src dst\n");
 	fprintf(stderr, "        cpdp -l -f db\n");
+	fprintf(stderr, "        cpdp -P -f db newdb\n");
 	fprintf(stderr, "        cpdp [-b bs] (-X | -U [-c] [-d]) -f db file\n");
 	fprintf(stderr, " -c  enable clonerange (warning: not atomic!)\n");
 	fprintf(stderr, " -b  set block size to bs bytes (KiB if k suffix)\n");
 	fprintf(stderr, " -l  list files from db\n");
+	fprintf(stderr, " -P  copy files from db to newdb (compact db)\n");
 	fprintf(stderr, " -X  delete file from db\n");
 	fprintf(stderr, " -U  update or insert file to db\n");
 	fprintf(stderr, " -d   also deduplicate file\n");
@@ -1532,6 +1608,7 @@ void usage(void)
 
 enum action {
 	ACTION_COPY,
+	ACTION_COPY_DBFILES = 'P',
 	ACTION_LIST = 'l',
 	ACTION_DELETE = 'X',
 	ACTION_UPDATE = 'U'
@@ -1546,7 +1623,7 @@ int main(int argc, char **argv)
 	enum action action = ACTION_COPY;
 	int dfd, opt, dbmode, dedupupd = 0;
 	dfd = 0; /* gcc not smart enough */
-	while ((opt = getopt(argc, argv, "cb:lXUdf:")) != -1) {
+	while ((opt = getopt(argc, argv, "cb:lPXUdf:")) != -1) {
 		switch (opt) {
 		case 'b':
 			tbs = (blksize_t)strtoll(optarg, &suffix, 10);
@@ -1570,6 +1647,7 @@ int main(int argc, char **argv)
 			enableclone = 1;
 			break;
 		case 'l':
+		case 'P':
 		case 'X':
 		case 'U':
 			if (action != ACTION_COPY) usage();
@@ -1601,7 +1679,9 @@ int main(int argc, char **argv)
 		if (argc != 0 || dbfile == NULL) usage();
 	}
 	if (dbfile != NULL) {
-		dbmode = (action == ACTION_LIST) ? O_RDONLY : O_RDWR | O_CREAT;
+		dbmode = (action == ACTION_LIST
+			|| action == ACTION_COPY_DBFILES)
+			? O_RDONLY : O_RDWR | O_CREAT;
 		if ((dfd = open(dbfile, dbmode, 0666)) == -1) {
 			perror(dbfile);
 			return EXIT_FAILURE;
@@ -1612,6 +1692,10 @@ int main(int argc, char **argv)
 			if (dbfile != NULL)
 				files = load_files(dfd, R_OK, 1, NULL);
 			if (copy_file(argv[0], argv[1], files, &fout, tbs)==-1)
+				return EXIT_FAILURE;
+			break;
+		case ACTION_COPY_DBFILES:
+			if (copy_dbfiles(dfd, argv[0]) == -1)
 				return EXIT_FAILURE;
 			break;
 		case ACTION_LIST:
